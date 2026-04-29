@@ -1,32 +1,49 @@
 // Hidden coin menu for Golf Orbit (Unity WebGL).
-// Triggered by pressing the keys listed in CHEAT_CONFIG.sequence in order
-// within CHEAT_CONFIG.windowMs milliseconds. Adds coins by calling Unity
-// SendMessage on the GameObject/method pairs in CHEAT_CONFIG.sendMessageTargets.
-// GameDatas marks itself dirty when coins change and auto-saves to PlayerPrefs
-// (Pinpin_SavedData) -> IndexedDB, so no extra save call is needed.
+//
+// Trigger: press keys in CHEAT_CONFIG.sequence in order within CHEAT_CONFIG.windowMs.
+// Adds coins by broadcasting Unity SendMessage to ALL candidate GameObject/method
+// pairs in CHEAT_CONFIG.sendMessageTargets. Unity's SendMessage silently logs a
+// warning when the GameObject doesn't exist (it does NOT throw), so we have to
+// fan out and let the right target respond -- we can't probe by catching errors.
+//
+// GameDatas marks itself dirty on coin change and auto-saves to PlayerPrefs
+// ("Pinpin_SavedData") -> IndexedDB, so changes persist across reloads.
 
 (function () {
   // ---------------------------------------------------------------------------
-  // CONFIG -- edit anything in here to retune the menu. No other code should
-  // need to change for normal tweaks.
+  // CONFIG -- edit anything here to retune the menu. No other code should need
+  // to change for normal tweaks.
   // ---------------------------------------------------------------------------
   const CHEAT_CONFIG = {
     sequence: ['0', '6', '8'],
     windowMs: 3000,
 
-    // SendMessage targets, tried in order until one succeeds. If a future
-    // version of the game uses a different GameObject name, just add it here.
+    // Broadcast list. Every entry is called on every grant -- whichever
+    // GameObject actually exists in the scene will receive AddCoins(amount);
+    // the rest produce a harmless "GameObject not found" warning in the Unity
+    // console. Add more candidates here if a future build renames things.
     sendMessageTargets: [
-      { gameObject: 'MainSceneManager', method: 'AddCoins' },
-      { gameObject: 'GameManager',      method: 'AddCoins' },
-      { gameObject: 'GameDatas',        method: 'AddCoins' },
+      { gameObject: 'MainSceneManager',    method: 'AddCoins' },
+      { gameObject: 'GameManager',         method: 'AddCoins' },
+      { gameObject: 'GameDatas',           method: 'AddCoins' },
+      { gameObject: 'MainSceneUIManager',  method: 'AddCoins' },
+      { gameObject: 'UIManager',           method: 'AddCoins' },
+      { gameObject: 'GameController',      method: 'AddCoins' },
+      { gameObject: 'MSStartIntegration',  method: 'AddCoins' },
+      { gameObject: 'CoinManager',         method: 'AddCoins' },
+      { gameObject: 'Player',              method: 'AddCoins' },
+      { gameObject: 'PlayerData',          method: 'AddCoins' },
+      { gameObject: 'Manager',             method: 'AddCoins' },
+      { gameObject: 'MainScene',           method: 'AddCoins' },
     ],
 
-    // Optional save nudge after granting (most builds auto-save, this is a
-    // belt-and-suspenders no-op if the GameObject/method don't exist).
+    // Optional save nudge after granting (most builds auto-save when GameDatas
+    // is dirty; these are belt-and-suspenders no-ops if not present).
     saveTargets: [
       { gameObject: 'GameDatas', method: 'Save' },
       { gameObject: 'GameDatas', method: 'ForceSave' },
+      { gameObject: 'GameDatas', method: 'SaveData' },
+      { gameObject: 'GameManager', method: 'Save' },
     ],
 
     presetAmounts: [100, 1000, 10000, 100000, 1000000],
@@ -51,7 +68,11 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Coin granting
+  // Coin granting -- broadcast to every candidate. SendMessage doesn't throw
+  // on a missing GameObject in WebGL (it logs a warning and returns), so we
+  // can't tell from JS which target actually received the call. We just send
+  // them all and let the user verify via the in-game coin counter or the
+  // Diagnose button.
   // ---------------------------------------------------------------------------
   function grantCoins(amount) {
     if (!Number.isFinite(amount) || amount <= 0 || amount > CHEAT_CONFIG.maxAmount) {
@@ -61,29 +82,89 @@
 
     const inst = window.gameInstance;
     if (!inst || typeof inst.SendMessage !== 'function') {
-      return { ok: false, error: 'Unity not ready yet' };
+      return { ok: false, error: 'Unity not ready yet -- wait for the game to load.' };
     }
 
+    let attempts = 0;
+    let firstError = null;
     for (const t of CHEAT_CONFIG.sendMessageTargets) {
       try {
         inst.SendMessage(t.gameObject, t.method, amount);
-        log('granted via', t.gameObject + '.' + t.method, amount);
-        // Try save nudge -- failures are silently ignored.
-        for (const s of CHEAT_CONFIG.saveTargets) {
-          try { inst.SendMessage(s.gameObject, s.method); } catch (_) { /* ignore */ }
-        }
-        return { ok: true, via: t.gameObject + '.' + t.method };
+        attempts++;
+        log('  sent', t.gameObject + '.' + t.method, amount);
       } catch (e) {
-        log('SendMessage failed on', t.gameObject + '.' + t.method, e);
+        if (!firstError) firstError = String(e);
+        log('  threw on', t.gameObject + '.' + t.method, e);
       }
     }
-    return { ok: false, error: 'No SendMessage target accepted the call. See console.' };
+    for (const s of CHEAT_CONFIG.saveTargets) {
+      try { inst.SendMessage(s.gameObject, s.method); } catch (_) { /* ignore */ }
+    }
+
+    if (attempts === 0) {
+      return { ok: false, error: firstError || 'All SendMessage calls threw.' };
+    }
+    return { ok: true, attempts };
+  }
+
+  // ---------------------------------------------------------------------------
+  // IndexedDB diagnostic -- enumerates databases and looks for the Unity
+  // PlayerPrefs blob that holds Pinpin_SavedData. Useful for the user to
+  // confirm that anything is being persisted at all.
+  // ---------------------------------------------------------------------------
+  async function diagnoseStorage() {
+    const lines = [];
+    try {
+      const dbs = (indexedDB.databases ? await indexedDB.databases() : []);
+      lines.push('IndexedDB databases: ' + (dbs.length ? dbs.map(d => d.name).join(', ') : '(none reported)'));
+      for (const d of dbs) {
+        if (!d.name) continue;
+        try {
+          const info = await readDbSummary(d.name);
+          lines.push('  ' + d.name + ' -> ' + info);
+        } catch (e) {
+          lines.push('  ' + d.name + ' -> error: ' + e);
+        }
+      }
+    } catch (e) {
+      lines.push('Could not list databases: ' + e);
+    }
+    lines.push('');
+    lines.push('Unity gameInstance ready: ' + !!(window.gameInstance && window.gameInstance.SendMessage));
+    return lines.join('\n');
+  }
+
+  function readDbSummary(dbName) {
+    return new Promise((resolve, reject) => {
+      const req = indexedDB.open(dbName);
+      req.onerror = () => reject(req.error);
+      req.onsuccess = () => {
+        const db = req.result;
+        const stores = Array.from(db.objectStoreNames);
+        if (!stores.length) { db.close(); return resolve('no object stores'); }
+        const tx = db.transaction(stores, 'readonly');
+        const summaries = [];
+        let pending = stores.length;
+        for (const name of stores) {
+          const store = tx.objectStore(name);
+          const countReq = store.count();
+          countReq.onsuccess = () => {
+            summaries.push(name + '(' + countReq.result + ')');
+            if (--pending === 0) { db.close(); resolve('stores=' + summaries.join(',')); }
+          };
+          countReq.onerror = () => {
+            summaries.push(name + '(?)');
+            if (--pending === 0) { db.close(); resolve('stores=' + summaries.join(',')); }
+          };
+        }
+      };
+    });
   }
 
   // ---------------------------------------------------------------------------
   // Menu UI (built once, hidden until triggered)
   // ---------------------------------------------------------------------------
-  let backdrop, panel, statusEl, customInput;
+  let backdrop, panel, statusEl, customInput, diagBox;
 
   function buildMenu() {
     backdrop = document.createElement('div');
@@ -97,8 +178,8 @@
     panel = document.createElement('div');
     Object.assign(panel.style, {
       background: '#fff', color: '#222', borderRadius: '12px', padding: '20px 24px',
-      width: 'min(360px, 90vw)', boxShadow: '0 10px 40px rgba(0,0,0,0.4)',
-      position: 'relative',
+      width: 'min(420px, 92vw)', boxShadow: '0 10px 40px rgba(0,0,0,0.4)',
+      position: 'relative', maxHeight: '90vh', overflowY: 'auto',
     });
     panel.addEventListener('click', e => e.stopPropagation());
 
@@ -138,9 +219,31 @@
     customRow.append(customInput, addBtn);
 
     statusEl = document.createElement('div');
-    Object.assign(statusEl.style, { fontSize: '13px', color: '#555', minHeight: '18px' });
+    Object.assign(statusEl.style, { fontSize: '13px', color: '#555', minHeight: '18px', marginBottom: '12px' });
 
-    panel.append(header, presetRow, customRow, statusEl);
+    const diagRow = document.createElement('div');
+    Object.assign(diagRow.style, { display: 'flex', gap: '6px', alignItems: 'center', marginBottom: '8px' });
+    const diagBtn = document.createElement('button');
+    diagBtn.textContent = 'Diagnose storage';
+    Object.assign(diagBtn.style, presetButtonStyle());
+    diagBtn.addEventListener('click', async () => {
+      diagBox.value = 'Inspecting...';
+      diagBox.value = await diagnoseStorage();
+    });
+    const note = document.createElement('span');
+    note.textContent = 'If coins didn\'t change, click this and check console.';
+    Object.assign(note.style, { fontSize: '11px', color: '#888' });
+    diagRow.append(diagBtn, note);
+
+    diagBox = document.createElement('textarea');
+    diagBox.readOnly = true;
+    diagBox.rows = 6;
+    Object.assign(diagBox.style, {
+      width: '100%', boxSizing: 'border-box', fontFamily: 'monospace', fontSize: '11px',
+      border: '1px solid #ddd', borderRadius: '6px', padding: '6px', resize: 'vertical',
+    });
+
+    panel.append(header, presetRow, customRow, statusEl, diagRow, diagBox);
     backdrop.appendChild(panel);
     backdrop.addEventListener('click', closeMenu);
     document.body.appendChild(backdrop);
@@ -166,10 +269,11 @@
   }
 
   function submit(amount) {
+    log('grantCoins ->', amount);
     const result = grantCoins(amount);
     if (result.ok) {
       statusEl.style.color = '#1a7f37';
-      statusEl.textContent = 'Added ' + amount + ' coins via ' + result.via;
+      statusEl.textContent = 'Broadcast +' + amount + ' to ' + result.attempts + ' targets. Check the in-game counter.';
     } else {
       statusEl.style.color = '#c62828';
       statusEl.textContent = result.error;
@@ -180,6 +284,7 @@
     if (!backdrop) buildMenu();
     backdrop.style.display = 'flex';
     statusEl.textContent = '';
+    diagBox.value = '';
     customInput.focus();
     customInput.select();
     log('menu opened');
@@ -197,7 +302,6 @@
 
   function detectSequence(e) {
     if (isTypingTarget(e.target)) return;
-    // Esc closes the menu when it's open
     if (e.key === 'Escape' && backdrop && backdrop.style.display !== 'none') {
       closeMenu();
       return;
@@ -217,7 +321,6 @@
         openMenu();
       }
     } else {
-      // Allow restarting the sequence if the wrong key happens to be the first one.
       matchIndex = (e.key === CHEAT_CONFIG.sequence[0]) ? 1 : 0;
       if (matchIndex === 1) startTime = now;
     }

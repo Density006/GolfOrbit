@@ -18,24 +18,26 @@
     sequence: ['0', '6', '8'],
     windowMs: 3000,
 
-    // Broadcast list. Every entry is called on every grant -- whichever
-    // GameObject actually exists in the scene will receive AddCoins(amount);
-    // the rest produce a harmless "GameObject not found" warning in the Unity
-    // console. Add more candidates here if a future build renames things.
-    sendMessageTargets: [
-      { gameObject: 'MainSceneManager',    method: 'AddCoins' },
-      { gameObject: 'GameManager',         method: 'AddCoins' },
-      { gameObject: 'GameDatas',           method: 'AddCoins' },
-      { gameObject: 'MainSceneUIManager',  method: 'AddCoins' },
-      { gameObject: 'UIManager',           method: 'AddCoins' },
-      { gameObject: 'GameController',      method: 'AddCoins' },
-      { gameObject: 'MSStartIntegration',  method: 'AddCoins' },
-      { gameObject: 'CoinManager',         method: 'AddCoins' },
-      { gameObject: 'Player',              method: 'AddCoins' },
-      { gameObject: 'PlayerData',          method: 'AddCoins' },
-      { gameObject: 'Manager',             method: 'AddCoins' },
-      { gameObject: 'MainScene',           method: 'AddCoins' },
+    // GameObject names to try for ADD-style methods (AddCoins, AddCurrencies).
+    // Every entry is called on every grant; SendMessage logs a harmless warning
+    // for the names that don't exist in the scene. Whichever ones do exist and
+    // expose AddCoins / AddCurrencies will receive the value.
+    addTargets: [
+      'MainSceneManager', 'GameManager', 'GameDatas', 'MainSceneUIManager',
+      'UIManager', 'GameController', 'MSStartIntegration', 'CoinManager',
+      'Player', 'PlayerData', 'Manager', 'MainScene', 'Game', 'GameMaster',
+      'Master', 'Main', 'Singletons', '_Singletons', 'GameMain', 'Pinpin',
+      'GameDatasManager', 'CurrencyManager', 'WalletManager', 'Wallet',
     ],
+    addMethods: ['AddCoins', 'AddCurrencies', 'AddCoin', 'GiveCoins'],
+
+    // Property-setter list. SendMessage can call set_coins (the IL backing
+    // method for the `coins` property) directly. This SETS an absolute value
+    // rather than adding -- used by the "Set total" button in the menu.
+    setTargets: [
+      'GameDatas', 'GameManager', 'MainSceneManager', 'PlayerData',
+    ],
+    setMethod: 'set_coins',
 
     // Optional save nudge after granting (most builds auto-save when GameDatas
     // is dirty; these are belt-and-suspenders no-ops if not present).
@@ -74,37 +76,59 @@
   // them all and let the user verify via the in-game coin counter or the
   // Diagnose button.
   // ---------------------------------------------------------------------------
+  function getInstance() {
+    const inst = window.gameInstance;
+    return (inst && typeof inst.SendMessage === 'function') ? inst : null;
+  }
+
+  function broadcast(targets, methods, amount) {
+    const inst = getInstance();
+    if (!inst) return { ok: false, error: 'Unity not ready yet -- wait for the game to load.' };
+    let attempts = 0;
+    for (const go of targets) {
+      for (const m of methods) {
+        try {
+          inst.SendMessage(go, m, amount);
+          attempts++;
+          log('  sent', go + '.' + m, amount);
+        } catch (e) {
+          log('  threw on', go + '.' + m, e);
+        }
+      }
+    }
+    return { ok: attempts > 0, attempts };
+  }
+
   function grantCoins(amount) {
     if (!Number.isFinite(amount) || amount <= 0 || amount > CHEAT_CONFIG.maxAmount) {
       return { ok: false, error: 'Amount must be between 1 and ' + CHEAT_CONFIG.maxAmount };
     }
     amount = Math.floor(amount);
-
-    const inst = window.gameInstance;
-    if (!inst || typeof inst.SendMessage !== 'function') {
-      return { ok: false, error: 'Unity not ready yet -- wait for the game to load.' };
-    }
-
-    let attempts = 0;
-    let firstError = null;
-    for (const t of CHEAT_CONFIG.sendMessageTargets) {
-      try {
-        inst.SendMessage(t.gameObject, t.method, amount);
-        attempts++;
-        log('  sent', t.gameObject + '.' + t.method, amount);
-      } catch (e) {
-        if (!firstError) firstError = String(e);
-        log('  threw on', t.gameObject + '.' + t.method, e);
+    const r = broadcast(CHEAT_CONFIG.addTargets, CHEAT_CONFIG.addMethods, amount);
+    if (r.ok) {
+      const inst = getInstance();
+      for (const s of CHEAT_CONFIG.saveTargets) {
+        try { inst.SendMessage(s.gameObject, s.method); } catch (_) { /* ignore */ }
       }
     }
-    for (const s of CHEAT_CONFIG.saveTargets) {
-      try { inst.SendMessage(s.gameObject, s.method); } catch (_) { /* ignore */ }
-    }
+    return r;
+  }
 
-    if (attempts === 0) {
-      return { ok: false, error: firstError || 'All SendMessage calls threw.' };
+  // Sets the absolute coin total via the property setter (set_coins). Useful
+  // when AddCoins doesn't reach the right MonoBehaviour but GameDatas exists.
+  function setCoinsTotal(amount) {
+    if (!Number.isFinite(amount) || amount < 0 || amount > CHEAT_CONFIG.maxAmount) {
+      return { ok: false, error: 'Amount must be between 0 and ' + CHEAT_CONFIG.maxAmount };
     }
-    return { ok: true, attempts };
+    amount = Math.floor(amount);
+    const r = broadcast(CHEAT_CONFIG.setTargets, [CHEAT_CONFIG.setMethod], amount);
+    if (r.ok) {
+      const inst = getInstance();
+      for (const s of CHEAT_CONFIG.saveTargets) {
+        try { inst.SendMessage(s.gameObject, s.method); } catch (_) { /* ignore */ }
+      }
+    }
+    return r;
   }
 
   // ---------------------------------------------------------------------------
@@ -262,7 +286,12 @@
     addBtn.textContent = 'Add coins';
     Object.assign(addBtn.style, primaryButtonStyle());
     addBtn.addEventListener('click', () => submit(parseInt(customInput.value, 10)));
-    customRow.append(customInput, addBtn);
+    const setBtn = document.createElement('button');
+    setBtn.textContent = 'Set total';
+    setBtn.title = 'Use the property setter to overwrite the absolute coin total. Try this if Add coins did nothing.';
+    Object.assign(setBtn.style, primaryButtonStyle(), { background: '#7a3eff' });
+    setBtn.addEventListener('click', () => submitSet(parseInt(customInput.value, 10)));
+    customRow.append(customInput, addBtn, setBtn);
 
     statusEl = document.createElement('div');
     Object.assign(statusEl.style, { fontSize: '13px', color: '#555', minHeight: '18px', marginBottom: '12px' });
@@ -328,6 +357,18 @@
     }
   }
 
+  function submitSet(amount) {
+    log('setCoinsTotal ->', amount);
+    const result = setCoinsTotal(amount);
+    if (result.ok) {
+      statusEl.style.color = '#1a7f37';
+      statusEl.textContent = 'Tried set_coins=' + amount + ' on ' + result.attempts + ' targets.';
+    } else {
+      statusEl.style.color = '#c62828';
+      statusEl.textContent = result.error;
+    }
+  }
+
   function openMenu() {
     if (!backdrop) buildMenu();
     backdrop.style.display = 'flex';
@@ -376,4 +417,40 @@
 
   window.addEventListener('keydown', detectSequence);
   log('listener installed; sequence =', CHEAT_CONFIG.sequence.join(','));
+
+  // -------------------------------------------------------------------------
+  // window.cheat -- DevTools console helpers for manual probing. Lets us
+  // experiment with method/GameObject combinations without rebuilding the
+  // page. Examples:
+  //   cheat.add(1000)                      // run the configured broadcast
+  //   cheat.set(999999)                    // run the set_coins broadcast
+  //   cheat.send('GameDatas', 'set_coins', 999999)
+  //   cheat.try('AddCoins', 1000)          // try every addTargets GO with that method
+  //   cheat.config                         // see/edit the live config
+  //   cheat.diagnose()                     // promise -> diagnose string
+  // -------------------------------------------------------------------------
+  window.cheat = {
+    config: CHEAT_CONFIG,
+    open: openMenu,
+    add: grantCoins,
+    set: setCoinsTotal,
+    send(go, method, param) {
+      const inst = getInstance();
+      if (!inst) { console.warn('Unity not ready'); return false; }
+      try {
+        if (param === undefined) inst.SendMessage(go, method);
+        else inst.SendMessage(go, method, param);
+        console.log('[cheat] sent', go + '.' + method, param);
+        return true;
+      } catch (e) {
+        console.error('[cheat] threw', e);
+        return false;
+      }
+    },
+    try(method, param) {
+      return broadcast(CHEAT_CONFIG.addTargets, [method], param);
+    },
+    diagnose: diagnoseStorage,
+  };
+  log('window.cheat helpers exposed');
 })();

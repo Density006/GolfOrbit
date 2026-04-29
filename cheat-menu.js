@@ -108,57 +108,103 @@
   }
 
   // ---------------------------------------------------------------------------
-  // IndexedDB diagnostic -- enumerates databases and looks for the Unity
-  // PlayerPrefs blob that holds Pinpin_SavedData. Useful for the user to
-  // confirm that anything is being persisted at all.
+  // IndexedDB diagnostic -- enumerates the /idbfs database (where Unity stores
+  // PlayerPrefs as a virtual file) and dumps the file paths plus a hex/ascii
+  // preview of any PlayerPrefs blob. This is what tells us how the game is
+  // actually persisting coin data.
   // ---------------------------------------------------------------------------
   async function diagnoseStorage() {
     const lines = [];
+    lines.push('Unity gameInstance ready: ' + !!(window.gameInstance && window.gameInstance.SendMessage));
     try {
       const dbs = (indexedDB.databases ? await indexedDB.databases() : []);
       lines.push('IndexedDB databases: ' + (dbs.length ? dbs.map(d => d.name).join(', ') : '(none reported)'));
       for (const d of dbs) {
         if (!d.name) continue;
         try {
-          const info = await readDbSummary(d.name);
-          lines.push('  ' + d.name + ' -> ' + info);
+          lines.push('');
+          lines.push('=== ' + d.name + ' ===');
+          const detail = await readDbDetail(d.name);
+          lines.push(detail);
         } catch (e) {
-          lines.push('  ' + d.name + ' -> error: ' + e);
+          lines.push('  error: ' + e);
         }
       }
     } catch (e) {
       lines.push('Could not list databases: ' + e);
     }
-    lines.push('');
-    lines.push('Unity gameInstance ready: ' + !!(window.gameInstance && window.gameInstance.SendMessage));
     return lines.join('\n');
   }
 
-  function readDbSummary(dbName) {
+  function readDbDetail(dbName) {
     return new Promise((resolve, reject) => {
       const req = indexedDB.open(dbName);
       req.onerror = () => reject(req.error);
       req.onsuccess = () => {
         const db = req.result;
         const stores = Array.from(db.objectStoreNames);
-        if (!stores.length) { db.close(); return resolve('no object stores'); }
+        if (!stores.length) { db.close(); return resolve('  (no object stores)'); }
         const tx = db.transaction(stores, 'readonly');
-        const summaries = [];
+        const out = [];
         let pending = stores.length;
-        for (const name of stores) {
-          const store = tx.objectStore(name);
-          const countReq = store.count();
-          countReq.onsuccess = () => {
-            summaries.push(name + '(' + countReq.result + ')');
-            if (--pending === 0) { db.close(); resolve('stores=' + summaries.join(',')); }
+        const finish = () => { db.close(); resolve(out.join('\n')); };
+        for (const storeName of stores) {
+          const store = tx.objectStore(storeName);
+          const keysReq = store.getAllKeys();
+          keysReq.onsuccess = () => {
+            const keys = keysReq.result || [];
+            out.push('  store ' + storeName + ' (' + keys.length + ' keys):');
+            if (!keys.length) { if (--pending === 0) finish(); return; }
+            let perKey = keys.length;
+            keys.forEach(k => {
+              const valReq = store.get(k);
+              valReq.onsuccess = () => {
+                out.push('    [' + JSON.stringify(k) + '] -> ' + describeValue(valReq.result));
+                if (--perKey === 0 && --pending === 0) finish();
+              };
+              valReq.onerror = () => {
+                out.push('    [' + JSON.stringify(k) + '] -> read error');
+                if (--perKey === 0 && --pending === 0) finish();
+              };
+            });
           };
-          countReq.onerror = () => {
-            summaries.push(name + '(?)');
-            if (--pending === 0) { db.close(); resolve('stores=' + summaries.join(',')); }
+          keysReq.onerror = () => {
+            out.push('  store ' + storeName + ' -> error reading keys');
+            if (--pending === 0) finish();
           };
         }
       };
     });
+  }
+
+  function describeValue(v) {
+    if (v == null) return String(v);
+    if (typeof v === 'string') return 'string(' + v.length + '): ' + v.slice(0, 200);
+    if (v instanceof Uint8Array) return 'Uint8Array(' + v.length + '): ' + previewBytes(v);
+    if (v instanceof ArrayBuffer) return 'ArrayBuffer(' + v.byteLength + '): ' + previewBytes(new Uint8Array(v));
+    if (typeof v === 'object') {
+      const keys = Object.keys(v);
+      const parts = keys.slice(0, 6).map(k => {
+        const sub = v[k];
+        if (sub instanceof Uint8Array) return k + '=Uint8Array(' + sub.length + '): ' + previewBytes(sub);
+        if (sub instanceof ArrayBuffer) return k + '=ArrayBuffer(' + sub.byteLength + '): ' + previewBytes(new Uint8Array(sub));
+        if (typeof sub === 'object') return k + '={' + Object.keys(sub).slice(0, 4).join(',') + '}';
+        return k + '=' + String(sub).slice(0, 60);
+      });
+      return 'object{' + parts.join('; ') + '}';
+    }
+    return typeof v + ' ' + String(v).slice(0, 80);
+  }
+
+  function previewBytes(u8) {
+    const n = Math.min(u8.length, 80);
+    const hex = [];
+    let ascii = '';
+    for (let i = 0; i < n; i++) {
+      hex.push(u8[i].toString(16).padStart(2, '0'));
+      ascii += (u8[i] >= 32 && u8[i] < 127) ? String.fromCharCode(u8[i]) : '.';
+    }
+    return hex.join('') + ' | ' + ascii + (u8.length > n ? ' ...' : '');
   }
 
   // ---------------------------------------------------------------------------
@@ -178,8 +224,8 @@
     panel = document.createElement('div');
     Object.assign(panel.style, {
       background: '#fff', color: '#222', borderRadius: '12px', padding: '20px 24px',
-      width: 'min(420px, 92vw)', boxShadow: '0 10px 40px rgba(0,0,0,0.4)',
-      position: 'relative', maxHeight: '90vh', overflowY: 'auto',
+      width: 'min(640px, 95vw)', boxShadow: '0 10px 40px rgba(0,0,0,0.4)',
+      position: 'relative', maxHeight: '92vh', overflowY: 'auto',
     });
     panel.addEventListener('click', e => e.stopPropagation());
 
@@ -237,10 +283,12 @@
 
     diagBox = document.createElement('textarea');
     diagBox.readOnly = true;
-    diagBox.rows = 6;
+    diagBox.rows = 14;
+    diagBox.placeholder = 'Diagnose output appears here. You can select-all + copy.';
     Object.assign(diagBox.style, {
       width: '100%', boxSizing: 'border-box', fontFamily: 'monospace', fontSize: '11px',
       border: '1px solid #ddd', borderRadius: '6px', padding: '6px', resize: 'vertical',
+      whiteSpace: 'pre',
     });
 
     panel.append(header, presetRow, customRow, statusEl, diagRow, diagBox);
